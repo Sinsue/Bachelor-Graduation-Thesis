@@ -1,0 +1,484 @@
+#20185097 신은수 학사졸업논문 1 사용 스크립트
+
+##Sample design with Seurat
+.libPaths("/home/qkrtltm100/R_packages")
+library(sctransform)
+library(Seurat)
+library(SeuratWrappers)
+library(SeuratData)
+library(data.table)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+setwd('/home/qkrtltm100/kidney_organoid_3/organoids')
+
+##carry out standard seurat process
+file_list <- list.files()
+sampleNames = mapply(function(x) x[length(x)], strsplit(file_list, split = '_'))
+sampleNames <- gsub('-','_',sampleNames)
+meta.info = data.table(file_Path = file_list,
+                       sampleID = sampleNames)
+
+meta.info[, SubType:=mapply(function(x) x[1], strsplit(sampleID, '_'))]
+DT::datatable(meta.info)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#meta.info = meta.info[grep('ATC',SubType,invert = T)]
+
+norm_method = 'standard'
+treat = FALSE
+show = FALSE
+### set the threshold of MT genome percentage: 20%
+MT_cut = 15
+
+
+batch_list = list()
+
+for(i in 1:nrow(meta.info)){
+  dir_of_10X = meta.info$file_Path[i]
+  sampleID = meta.info$sampleID[i]
+  subtype = meta.info$SubType[i]
+  seq_batch = meta.info$Batch[i]
+  print(paste("Starting processing", sampleID, 'at', Sys.time()))
+  sc_mat = Read10X(dir_of_10X)
+  
+  sc_tumor <- CreateSeuratObject(counts = sc_mat, project = sampleID, min.cells = 3)
+  sc_tumor
+  
+  sc_tumor[["percent.mt"]] <- PercentageFeatureSet(sc_tumor, pattern = "^MT-")
+  
+  qc = VlnPlot(sc_tumor, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+  
+  plot1 <- FeatureScatter(sc_tumor, feature1 = "nCount_RNA", feature2 = "percent.mt")
+  plot2 <- FeatureScatter(sc_tumor, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+  
+  
+  sc_tumor <- subset(sc_tumor, subset = nFeature_RNA > 500 & nFeature_RNA < 5000  & percent.mt <= MT_cut)
+  
+  if(norm_method == 'SCT'){
+    sc_tumor <- SCTransform(sc_tumor, vars.to.regress = 'percent.mt')
+  } else{
+    sc_tumor <- NormalizeData(sc_tumor, verbose = F)
+    sc_tumor <- FindVariableFeatures(sc_tumor, selection.method = "vst", 
+                                     nfeatures = 2000, verbose = FALSE)
+    
+    sc_tumor <- ScaleData(sc_tumor, verbose = F)
+  }
+  
+  
+  sc_tumor <- RenameCells(object = sc_tumor, add.cell.id = sampleID)  # add sample name as prefix
+  if(treat == TRUE){
+    sc_tumor <- RunPCA(sc_tumor, verbose = T)
+    sc_tumor <- RunUMAP(sc_tumor, dims = 1:30, verbose = FALSE)
+    sc_tumor <- RunTSNE(sc_tumor, dims = 1:30, verbose = FALSE)
+    
+    sc_tumor <- FindNeighbors(sc_tumor, dims = 1:30, verbose = FALSE)
+    sc_tumor <- FindClusters(sc_tumor, verbose = FALSE)
+    
+    umap = DimPlot(sc_tumor, label = TRUE) + NoLegend()
+    tsne = TSNEPlot(sc_tumor, label = TRUE) + NoLegend()
+    
+    if(show == TRUE){
+      #pdf(paste0('~/Project/sc_ATC/figure/QC/',sampleID,'_Seurat_QC.pdf'),12,7.5)
+      print(qc)
+      plot_grid(plot1,plot2)
+      #dev.off()
+      #pdf(paste0('~/Project/sc_ATC/figure/Clustering/',sampleID,'_Seurat_Dimension_reduction_and_Clustering.pdf'))
+      print(umap)
+      print(tsne)
+    }
+  }
+  
+  #dev.off()
+  ### add information
+  sc_tumor@meta.data[,'SubType'] = subtype
+  sc_tumor@meta.data[,'SampleID'] = sampleID
+  sc_tumor@meta.data[,'Batch'] = seq_batch
+  ### add batch data into a list to merge
+  #assign(paste0(sampleID,'.Seurat'),sc_tumor)
+  batch_list <- append(batch_list, sc_tumor)
+  print(paste("Finishing processing", sampleID, 'at', Sys.time()))
+}
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+kidney <- Reduce(function(x,y){merge(x,y,merge.data = TRUE)},batch_list)
+
+kidney <- FindVariableFeatures(kidney, selection.method = "vst",  nfeatures = 5000, verbose = FALSE)
+
+qc = VlnPlot(kidney, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size=0.1, ncol=3)
+qc
+
+all.gene<-rownames(kidney)
+kidney <- ScaleData(kidney, vars.to.regress = c('nCount_RNA', 'percent.mt'),
+                    verbose = F,features = all.gene)
+
+kidney <- RunPCA(kidney, npcs=30, verbose=F)
+kidney <- RunUMAP(kidney, reduction='pca', dims=1:30)
+kidney <- FindNeighbors(kidney, reduction = 'pca', dims=1:30)
+kidney <- FindClusters(kidney, resolution = 1)
+
+DimPlot(kidney, label = TRUE, label.size = 4) + NoLegend()
+
+save(kidney, file = ".RData")
+
+ElbowPlot(object = kidney, ndims = 30)
+
+DimPlot(kidney, label = TRUE, label.size = 2,ncol = 3) + NoLegend()
+
+#batch correction 
+kidney.all <- RunFastMNN(object.list = SplitObject(kidney, split.by = "orig.ident"))
+kidney.all <- RunUMAP(kidney.all, reduction = "mnn", dims = 1:30)
+kidney.all <- FindNeighbors(kidney.all, reduction = "mnn", dims = 1:30)
+kidney.all <- FindClusters(kidney.all, resolution = 1)
+
+
+DimPlot(kidney.all, label = T, label.size = 2, split.by = "SampleID",ncol = 3) + NoLegend()
+DimPlot(kidney.all, label = T, label.size = 4) + NoLegend()
+
+save(kidney.all, file = "kidney_after_batch_correction.RData")
+
+#count DEG number of each cluster
+for(j in 0:40){  # 18 <- number of clusters-1
+  
+  n=table(kidney.all@active.ident)
+  
+  ident=j
+  
+  n[names(n) %in% c(0:ident)]=0
+  
+  n=n[-1]
+  
+  o=n[n>0]
+  
+  ident2=names(o[1])
+  
+  bim <- FindMarkers(kidney.all, ident.1 = ident,  ident.2 =ident2, only.pos = F, test.use = "bimod")
+  
+  deg=bim[bim$p_val_adj < 0.01,]
+  
+  deg1=deg[abs(deg$avg_logFC) >= 1,]
+  
+  degs=dim(deg)
+  
+  degs1=dim(deg1)
+  
+  
+  for(i in c(names(o[-1]))){
+    
+    bim <- FindMarkers(kidney.all, ident.1 = ident,  ident.2 = i, only.pos = F, test.use = "bimod")
+    
+    deg=bim[bim$p_val_adj < 0.01,]
+    
+    deg1=deg[abs(deg$avg_logFC) >= 1,]
+    
+    degs=cbind(degs,dim(deg))
+    
+    degs1=cbind(degs1,dim(deg1))
+    
+  }
+  
+  print(degs1)
+  }
+  
+##marker gene search for annotating each clusters
+#mesenchyme
+FeaturePlot(kidney.all, features = c("CRABP2", "PRRX1", "DSE", "IGF2", "HMGA", 
+                                     "SEMA3A", "VIM", "TPM2", "PEG10", "HNRNPD", 
+                                     "TMSB15A", "PLK2", "HMGB1", "NR2F1", "TUBB", "NASP", 
+                                     "EDNRA", "43354", "ZFHX4", "SMC4"))
+FeaturePlot(kidney.all, features = c("COL3A1", "LGALS1", "LRRC17", "IGFBP5", "IGF1", "DCN", 
+                                     "POSTN", "COL1A2", "NRK", "COL6A3", "CDH11", "ALX1"))
+VlnPlot(kidney.all, features = c("COL3A1", "LGALS1", "LRRC17", "IGFBP5", "IGF1", "DCN", 
+                                 "POSTN", "COL1A2", "NRK", "COL6A3", "CDH11", "ALX1"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("CRABP2", "PRRX1", "DSE", "IGF2", "HMGA", 
+                                 "SEMA3A", "VIM", "TPM2", "PEG10", "HNRNPD"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("TMSB15A", "PLK2", "HMGB1", "NR2F1", "TUBB", "NASP", 
+                                 "EDNRA", "43354", "ZFHX4", "SMC4"), pt.size = 0.1)
+#loop progen = cell cycle
+FeaturePlot(kidney.all, features = c("CCNB1", "TOP2A", "PRC1", "UBE2C", "DLGAP5", "PIF1", "TPX2", "CEP55", "MKI67", "HMMR", "BUB1", "ECT2", "CENPF"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#melanocyte
+VlnPlot(kidney.all, features = c("PMEL", "DCT", "PLP1", "EDNRB", "MLANA", "MLANA", "TFAP2B", "TRPM1", "BCAN", "S100B", "NPR3", "LGI4", "ERBB3", "PHACTR3"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#EC/Endothelium
+FeaturePlot(kidney.all, features = c("PECAM1", "CD34", "ADGRL4", "CAV1", "KDR", "TM4SF18", "ESM1", "APLN", "GJA4", "CDH5", "MMP1", "GIMAP4"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#glial
+FeaturePlot(kidney.all, features = c("ATP1B1", "CDH6", "DMD", "FABP7", "LY6H", "MSX1", 
+                                     "NTRK2", "PENK", "PTN", "RFX4", "SAT1", "SOX2", 
+                                     "TPBG", "AP1S2", "NLRP1", "PCSK1N", "TTYH1", 
+                                     "RSPO3", "LYPD1", "TUBB2B", "LOC728392"))
+#MP
+VlnPlot(kidney.all, features = c("ACTA1", "ACTC1", "CDH15", "CKB", "DES", 
+                                 "MYH3", "MYL1", "MYOD1", "MYOG", "NEB", 
+                                 "NNAT", "PITX2", "TNNC2"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#Melanoma
+FeaturePlot(kidney.all, features = c("MLANA", "PMEL", "BCAN", "PLP1", "NSG1"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#DT
+FeaturePlot(kidney.all, features = c("IGFBP7", "WFDC2", "MAL", "ATP1B1", "EPCAM", "EMX2", "KRT19", "MPC2", "CLDN3", "SAT1", "SLC12A1"))
+VlnPlot(kidney.all, features = c(), pt.size = 0.1)
+#podocyte
+FeaturePlot(kidney.all, features = c("WT1", "SPINT2", "MAFB", 
+                                    "BCAM", "CLIC5", "VAMP8", "DUSP23",
+                                    "PODXL", "PTPRO", "ITM2B"), pt.size = 0.1)
+FeaturePlot(kidney.all, features = c("NTNG1", "GADD45A", "NPHS2", "PTPRO", "CTGF",
+                                    "ITIH5", "CFH", "ANXA1"))
+FeaturePlot(kidney.all, features = c("WT1", "PODXL", "PTPRO", "NPHS2", "ITIH5"))
+#proximal tubule
+VlnPlot(kidney.all, features = c("SLC13A3", "SLC34A1", "GPX3", "DCXR", "SLC22A8", "SLC22A7"), pt.size = 0.1)
+
+FeaturePlot(kidney.all, features = c( "KRT8", "KRT18", "VCAM1"))
+
+FeaturePlot(kidney.all, features = c("SPP1", "AFP", "EPCAM", "FGB", "PAX8",
+                                    "MT1G", "MT1H", "MT2A", "MT1E", "APOA1"))
+FeaturePlot(kidney.all, features = c("C14orf105", "DCDC2", "DPP4", "GNG11", "FLRT3",
+                                    "MT1F", "MT1X", "MT1HL1", "SLC3A1", "APOE" ))
+#LOH
+VlnPlot(kidney.all, features = c("TMEM52B", "MAL", "WFDC2", "MECOM", "LIMCH1",
+                                "SLC12A1", "LINC01158", "TFCP2L1", "CA12",
+                                "ACPP", "TMPRSS4", "CLDN10"), pt.size = 0.1)
+FeaturePlot(kidney.all, features = c("TMEM52B", "MAL", "WFDC2", "MECOM", "LIMCH1",
+                                    "SLC12A1", "LINC01158", "TFCP2L1", "CA12",
+                                    "ACPP", "TMPRSS4", "CLDN10"))
+#neuroprogenitor
+FeaturePlot(kidney.all, features = c("ATOH1", "CKB", "CRABP1", "DCX", "ELAVL3",
+                                    "ELAVL4", "GAP43", "MAP1B", "PRPH", "RTN1"))
+FeaturePlot(kidney.all, features = c("SOX11", "SSTR2", "TUBA1A", "MLLT11", "STMN2",
+                                    "TAGLN3", "HES6", "LHX9", "TUBB2B", "MIAT"))
+FeaturePlot(kidney.all, features = c("DCX", "PRPH", "RTN1", "ELAVL4", "STMN2", "LHX9"))
+VlnPlot(kidney.all, features = c("SOX2", "AP1S2", "TTYHH1", "RFX4", "TUBB2B", "NTRK2"), pt.size = 0.1)
+VlnPlot(kidney.all, features = "NPHS2")
+VlnPlot(kidney.all, features = c("CRABP1", "ELAVL4", "DCX", "STMN2", "ELAVL3"))
+
+#distal tube
+VlnPlot(kidney.all, features = c("DEFB1", "CLDN8", "TMEM213"), pt.size = 0.1)
+#muscle progenitor
+VlnPlot(kidney.all, features = c("ACTA1", "ACTC1", "CDH15",
+                                "DES", "MYL1", "MYL4" ), pt.size = 0.1)
+#Neuron
+FeaturePlot(kidney.all, features = c("SOX2", "DDIT4","FABP7", "TTYH1" ,
+                                    "DKK1", "SCG2", "MSX1", "PENK", 
+                                    "CNTNAP2"))
+VlnPlot(kidney.all, features = c("AP1S2", "RFX4", "TUBB2B", "NTRK2", "DMD", "FZD3"), pt.size = 0.1)
+
+FeaturePlot(kidney.all, features = c("C4orf48", "APLP1", "EFNB3", "TPBG", "ID2", 
+                                    "BEX1", "TTC3", "MAP1B", "PHYHIPL"))
+
+#stroma
+FeaturePlot(kidney.all, features = c("ACTA2", "ACTG2", "CALD1", "COL1A1", 
+                                    "COL9A2", "CRABP2", "EFNA5", "HNRNPA1"))
+FeaturePlot(kidney.all, features = c("COL3A1", "COL6A3", "CPB1", "NNAT", 
+                                    "HOXA10", "LUM", "MAB21L1", "NOVA1"))
+FeaturePlot(kidney.all, features = c("NRK", "PRRX1", "ZFHX4", "LGALS1", 
+                                    "IGFBP5", "COL9A2", "TPM1", "MAB21L1", "PCDH9"))
+FeaturePlot(kidney.all, features = c("BST2", "PCOLCE", "ZEB2", "IGF2", "IL11RA", 
+                                    "CXCL12", "NR2F1", "HOXA10", "MEIS2"))
+VlnPlot(kidney.all, features = c("NR2F2", "CoL1A1", "PDGFRB", "CRABP2", "TPM1", "CXCL14", 
+                                "C12orf57", "CALD1", "COL6A2", "CXCL12", "MEST"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("ACTA2", "ACTG2", "CALD1", "COL1A1", 
+                                "COL9A2", "CRABP2", "EFNA5", "HNRNPA1"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("COL3A1", "COL6A3", "CPB1", "NNAT", 
+                                "HOXA10", "LUM", "MAB21L1", "NOVA1"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("NRK", "PRRX1", "ZFHX4", "LGALS1", 
+                                "IGFBP5", "COL9A2", "TPM1", "MAB21L1", "PCDH9"), pt.size = 0.1)
+VlnPlot(kidney.all, features = c("BST2", "PCOLCE", "ZEB2", "IGF2", "IL11RA", 
+                                "CXCL12", "NR2F1", "HOXA10", "MEIS2"), pt.size = 0.1)
+#endothelium marker
+FeaturePlot(kidney.all, features = c("CALM1", "GNG11", "GYPC", "IGFBP3", "TCF4", "TMSB4X"))
+FeaturePlot(kidney.all, features = c("ATP1B1", "FXYD2", "CLU", "CLDN3", "EMX2", "FTL", "IGFBP7", "KRT19", "BCAM", "PAX2", "SPP1", "PAX8", "IFITM3"))
+FeaturePlot(kidney.all, features = c("ACTB", "FKBP1A", "GNG11", "MYL6", "PFN1", "S100A10", "FSCN1"))
+VlnPlot(kidney.all, features = c("GNG11", "EGFL7", "CLDN5", "ARHGAP29", "IGFBP3", "S100A16"), pt.size = 0.1)
+
+##marker gene complete
+kidney.all3 <- kidney.all
+markergene <- c("PODXL", "NPHS1", "IGFBP7", "LAMP5", "NPW", "CFH", "TPX2", "NUSAP1", "MECOM", "WFDC2", "SPP1", "MAL", "COL1A1", "COL3A1", "SOX2", "MSX1", "SOX18", "ECSCR", "CD34", "KDR", "PMEL", "PLP1", "DLL3", "HES6", "FAM211A", "CTNNB1", "HSPB1", "TOP2A", "MKI67")
+DotPlot(kidney.all3, features = markergene) +RotatedAxis()
+
+##cell cycle analysis
+#kidney.all33 = object for cell cycle analysis
+cellcyclegene <- read.table(file = 'CellcycleGene.txt', header = T)
+s.gene <- cellcyclegene$G1.S
+m.gene <- cellcyclegene$G2.M
+kidney.all33 <- kidney.all3
+kidney.all33 <- CellCycleScoring(kidney.all33, s.features = s.gene, g2m.features = m.gene, set.ident = T)
+DimPlot(kidney.all33, split.by = 'SampleID')
+table(kidney.all33@active.ident)
+#make bar grpah of cell percent of cell cycle analysis object
+aa <- table(kidney.all33@active.ident[kidney.all33$SampleID %in% 'control'])
+bb <- table(kidney.all33@active.ident[kidney.all33$SampleID %in% 'dECM'])
+cc <- table(kidney.all33@active.ident[kidney.all33$SampleID %in% 'VEGF'])
+dd <- data.frame(aa,bb,cc)
+dd <- data.frame(dd$Freq, dd$Freq.1, dd$Freq.2, row.names = dd$Var1.2)
+colnames(dd) <- c('control', "dECM", "VEGF")
+ee <-data.frame(1:54) 
+ee$Sample <- c(rep('control', 18), rep('dECM', 18), rep('VEGF', 18))
+ee$Cluster <- rep(rownames(dd), 3)
+ee$Percent <- c(dd$control, dd$dECM, dd$VEGF)
+ggplot(ee, aes(fill=Cluster, y=Percent, x=Sample)) + geom_bar(position="fill", stat="identity", colour='black') +coord_flip()
+
+##DEG analysis
+#marker genes
+pd.marker <- c("HIST1H4C", "CENPF", "NASP", "MKI67", "NPHS2", "PTPRO", "MAFB", "PODXL", "SOX4", "EMX2", "CDH6", "CCND1")
+pt.marker <- c("LHX1", "JAG1", "PAX8", "CDH6", "SLC27A2", "CCND1", "ODC1", "POU3F3", "HMGB2", "MT1H", "MT1M", "APOE", "FGB", "SLC3A1", "LRP2", "SLC34A1", "CUBN", "DAB2")
+loh.marker <- c("LHX1", "JAG1", "DKK1", "CCND1", "ODC1", "POU3F3", "ESRRG", "MAL", "SLC12A1", "WFDC2")
+#separating each cluster
+kidney.pd <- subset(kidney.all3, cells = names(kidney.all@active.ident[kidney.all@active.ident %in% c("Podocyte", "Podocyte_Prog")]))
+kidney.pt <- subset(kidney.all3, cells = names(kidney.all@active.ident[kidney.all@active.ident %in% c("PT")]))
+kidney.loh <- subset(kidney.all3, cells = names(kidney.all@active.ident[kidney.all@active.ident %in% c("LOH/DT")]))
+#seprating each sample
+kidney.con <- subset(kidney.all3, cells = names(kidney.all.a@active.ident[kidney.all.a$SampleID %in% c("control")]))
+kidney.de <- subset(kidney.all3, cells = names(kidney.all.a@active.ident[kidney.all.a$SampleID %in% c("dECM")]))
+kidney.ve <- subset(kidney.all3, cells = names(kidney.all.a@active.ident[kidney.all.a$SampleID %in% c("VEGF")]))
+#make separate orig.ident which have separated cluster and sample
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("control") & kidney.pt@active.ident %in% c("Podocyte")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "control.PD"
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("dECM") & kidney.pt@active.ident %in% c("Podocyte")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "dECM.PD"
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("VEGF") & kidney.pt@active.ident %in% c("Podocyte")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "VEGF.PD"
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("control") & kidney.pt@active.ident %in% c("Podocyte")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "control.PT"
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("dECM") & kidney.pt@active.ident %in% c("PT")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "dECM.PT"
+cpd <- subset(kidney.pt, cells = names(kidney.pt@active.ident[kidney.pt$SampleID %in% c("VEGF") & kidney.pt@active.ident %in% c("PT")]))
+Idents(object = kidney.pt, cells = colnames(cpd))= "VEGF.PT"
+cpd <- subset(kidney.loh, cells = names(kidney.loh@active.ident[kidney.loh$SampleID %in% c("control") & kidney.loh@active.ident %in% c("LOH/DT")]))
+Idents(object = kidney.loh, cells = colnames(cpd))= "control.LOH"
+cpd <- subset(kidney.loh, cells = names(kidney.loh@active.ident[kidney.loh$SampleID %in% c("dECM") & kidney.loh@active.ident %in% c("LOH/DT")]))
+Idents(object = kidney.loh, cells = colnames(cpd))= "dECM.LOH"
+cpd <- subset(kidney.loh, cells = names(kidney.loh@active.ident[kidney.loh$SampleID %in% c("VEGF") & kidney.loh@active.ident %in% c("LOH/DT")]))
+Idents(object = kidney.loh, cells = colnames(cpd))= "VEGF.LOH"
+table(kidney.pd@active.ident)
+table(kidney.pt@active.ident)
+table(kidney.loh@active.ident)
+#make dot plot
+DotPlot(kidney.pd, features = pd.marker) +RotatedAxis()
+DotPlot(kidney.pt, features = pt.marker) +RotatedAxis()
+DotPlot(kidney.loh, features = loh.marker) +RotatedAxis()
+
+### comarison with human kidney
+
+#fetal kidney
+#week17 fetal kidney GSE112570
+#fetal kidney object is kidney.all.fetal and kidney.all.fetal.a 
+
+kidney.all.fetal <-  RenameIdents(object = kidney.all.fetal, "0"="Pretubular1",  "3"='Pretubular1', "13"="Pretubular1",  "4"="Pretubular2", "12"="Podocyte", "16"="PT", "9"="DT/LOH", "1"="IC1", "11"="IC1", "15"="IC1", "2"="IC2", "8"="IC2", "5"='IC3', "10"="IC4", "7"="IC_Prog", "6"="Endothelial", "14"="Immune", "17"="Muscle_Prog")
+kidney.all.fetal.a <-  RenameIdents(object = kidney.all.fetal.a, "Pretubular1"="PA1", "Pretubular2"="PA2", "Podocyte"="PD", "PT"="PT", "DT/LOH"="DT", "IC1"="IC1", "IC2"="IC2", "IC3"='IC3', "IC4"="IC4", "IC_Prog"="ICP", "Endothelial"="ED", "Immune"="Im", "Muscle_Prog"="MP")
+#fetal.a is same fetal kidney object but cluster names is concised
+DimPlot(kidney.all.fetal, split.by = "SampleID", label = T, label.size = 4, ncol = 2)
+
+#adult kidney
+#adult kidney is derived from in lab 
+#adult kidney object is hKidney and hKidny.contr(hKidney.contrr)
+Idents(hKidney) <- hKidney$celltype
+DimPlot(hKidney)
+hKidney.contr <- subset(hKidney, cells = names(hKidney@active.ident[hKidney@active.ident %in% c('Podocyte', 'Proximal tubule', 'Proliferating Proximal Tubule', 'Distinct proximal tubule 1', 'Distinct proximal tubule 2', 'Thick ascending limb of Loop of Henle', 'Connecting tubule', 'Type A intercalated cell', 'Type B intercalated cell', 'Indistinct intercalated cell', 'Epithelial progenitor cell', 'Fibroblast', 'Myofibroblast', 'Glomerular endothelium', 'Peritubular capillary endothelium 1', 'Peritubular capillary endothelium 2', 'Ascending vasa recta endothelium', 'Descending vasa recta endothelium')]))
+#hKidney.contr is subset of human adult kidney which clusters is important for comparison analysis. Unnecessary clusters like immune cells are deleted 
+table(hKidney.contr@active.ident)
+hKidney.contrr <- RenameIdents(object = hKidney.contrr, 'Podocyte'='1', 'Proximal tubule'='2', 'Proliferating Proximal Tubule'='3', 'Distinct proximal tubule 1'='4', 'Distinct proximal tubule 2'='5', 'Thick ascending limb of Loop of Henle'='6', 'Connecting tubule'='7', 'Type A intercalated cell'='8', 'Type B intercalated cell'='9', 'Indistinct intercalated cell'='10', 'Epithelial progenitor cell'='11', 'Fibroblast'='12', 'Myofibroblast'='13', 'Glomerular endothelium'='14', 'Peritubular capillary endothelium 1'='15', 'Peritubular capillary endothelium 2'='16', 'Ascending vasa recta endothelium'='17', 'Descending vasa recta endothelium'='18')
+DimPlot(hKidney.contrr)
+#hKidney.contrr is same adult kidney object but cluster name is concised
+
+## cluster map
+#clustermap makes circle plot to compare two objects by line and color
+install_github("xgaoo/ClusterMap")
+library('ClusterMap')
+#make marker file of each kidney organoid
+kidney.cm <- kidney.all3
+kidney.cm.con <- subset(kidney.cm, cells = names(kidney.cm@active.ident[kidney.cm$SampleID %in% c("control")]))
+kidney.cm.de <- subset(kidney.cm, cells = names(kidney.cm@active.ident[kidney.cm$SampleID %in% c("dECM")]))
+kidney.cm.ve <- subset(kidney.cm, cells = names(kidney.cm@active.ident[kidney.cm$SampleID %in% c("VEGF")]))
+
+con.markers <- FindAllMarkers(object = kidney.cm.con, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+write.csv(con.markers,file='con.markers.csv')
+de.markers <- FindAllMarkers(object = kidney.cm.de, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+write.csv(de.markers,file='de.markers.csv')
+ve.markers <- FindAllMarkers(object = kidney.cm.ve, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+write.csv(ve.markers,file='ve.markers.csv')
+
+#compare to fetal kidney 
+#amke marker file
+fetal.kidney.marker <- FindAllMarkers(object = kidney.all.fetal.a, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+write.csv(fetal.kidney.marker, file = 'fetal_kidney_markers.csv')
+#compare to each organoids
+#VScontrol
+marker_file_list <- c(control='con.markers.csv', fetal.kidney='fetal_kidney_markers.csv' )
+fList <- c(control = kidney.cm.con, fetal.kidney = kidney.all.fetal.a)
+single_obj_list <- c(control= fList$control, fetal.kidney= fList$fetal.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'ConvsFetal', single_obj_list = single_obj_list)
+#VSdECM
+marker_file_list <- c(dECM='de.markers.csv', fetal.kidney='fetal_kidney_markers.csv' )
+fList <- c(dECM = kidney.cm.de, fetal.kidney = kidney.all.fetal.a)
+single_obj_list <- c(dECM= fList$dECM, fetal.kidney= fList$fetal.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'dECMvsFetal', single_obj_list = single_obj_list)
+#VSVEGF
+marker_file_list <- c(VEGF='ve.markers.csv', fetal.kidney='fetal_kidney_markers.csv' )
+fList <- c(VEGF = kidney.cm.ve, fetal.kidney = kidney.all.fetal.a)
+single_obj_list <- c(VEGF= fList$VEGF, fetal.kidney= fList$fetal.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'VEGFvsFetal', single_obj_list = single_obj_list)
+
+#adultkidney
+#make markerfile
+adult.kidney.marker <- FindAllMarkers(object = hKidney.contrr, only.pos = T, min.pct = 0.25, thresh.use = 0.25)
+write.csv(adult.kidney.marker, file = 'adult_kidney_markers.csv')
+#comparison
+#VScontrol
+marker_file_list <- c(control='con.markers.csv', adult.kidney='adult_kidney_markers.csv' )
+fList <- c(control = kidney.cm.con, adult.kidney = hKidney.contrr)
+single_obj_list <- c(control= fList$control, adult.kidney= fList$adult.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'ConvsAdult', single_obj_list = single_obj_list)
+#VSdECM
+marker_file_list <- c(dECM ='de.markers.csv', adult.kidney='adult_kidney_markers.csv' )
+fList <- c(dECM = kidney.cm.de, adult.kidney = hKidney.contrr)
+single_obj_list <- c(dECM= fList$dECM, adult.kidney= fList$adult.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'dECMvsAdult', single_obj_list = single_obj_list)
+#VSVEGF
+marker_file_list <- c(VEGF='ve.markers.csv', adult.kidney='adult_kidney_markers.csv' )
+fList <- c(VEGF = kidney.cm.ve, adult.kidney = hKidney.contrr)
+single_obj_list <- c(VEGF= fList$VEGF, adult.kidney= fList$adult.kidney)
+res <- cluster_map(marker_file_list, edge_cutoff = 0.1, output = 'VEGFvsAdult', single_obj_list = single_obj_list)
+
+## making merged cluster object of human kidney and organodis
+#fetal kidney
+kindey.list <- c(SplitObject(kidney.all3, split.by = "SampleID"), SplitObject(kidney.all.fetal, split.by = 'SampleID'))
+kindey.list <- lapply(X=kindey.list, FUN = function(x){　
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)} )
+
+features <- SelectIntegrationFeatures(object.list = kindey.list)
+kidney.anchor <- FindIntegrationAnchors(object.list = kindey.list, anchor.features = features)
+kidney.combined <- IntegrateData(anchorset = kidney.anchor)
+
+DefaultAssay(kidney.combined) <- "integrated"
+
+kidney.combined <- ScaleData(kidney.combined, verbose = T)
+kidney.combined <- RunPCA(kidney.combined, npcs = 30, verbose = F)
+kidney.combined <- RunUMAP(kidney.combined, reduction = "pca", dims = 1:30)
+kidney.combined <- FindNeighbors(kidney.combined, reduction = 'pca', dims = 1:30)
+kidney.combined <- FindClusters(kidney.combined, resolution = 1)
+DimPlot(kidney.combined, reduction = "umap", group.by = "SampleID")
+DimPlot(kidney.combined, split.by = "SampleID")
+
+#adult kidney
+kindey.list <- c(SplitObject(kidney.all3, split.by = "SampleID"), hKidney.contr)
+kindey.list <- lapply(X=kindey.list, FUN = function(x){　
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)} )
+
+features <- SelectIntegrationFeatures(object.list = kindey.list)
+kidney.anchor <- FindIntegrationAnchors(object.list = kindey.list, anchor.features = features)
+kidney.combined <- IntegrateData(anchorset = kidney.anchor)
+
+DefaultAssay(kidney.combined) <- "integrated"
+
+kidney.combined <- ScaleData(kidney.combined, verbose = T)
+kidney.combined <- RunPCA(kidney.combined, npcs = 30, verbose = F)
+kidney.combined <- RunUMAP(kidney.combined, reduction = "pca", dims = 1:30)
+kidney.combined <- FindNeighbors(kidney.combined, reduction = 'pca', dims = 1:30)
+kidney.combined <- FindClusters(kidney.combined, resolution = 1)
+DimPlot(kidney.combined, reduction = "umap", group.by = "SampleID")
+DimPlot(kidney.combined, split.by = "SampleID")
+
+
